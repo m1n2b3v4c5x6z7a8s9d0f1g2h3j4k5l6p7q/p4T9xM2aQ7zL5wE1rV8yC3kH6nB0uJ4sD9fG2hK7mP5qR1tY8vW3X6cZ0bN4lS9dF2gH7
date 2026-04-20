@@ -1,0 +1,1007 @@
+name: iOS Build Capacitor Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      # Repository
+      repository_url:
+        description: 'Your Capacitor app repository URL'
+        required: true
+        type: string
+      
+      repository_branch:
+        description: 'Branch to build'
+        required: false
+        type: string
+        default: 'main'
+      
+      is_private_repo:
+        description: 'Is repository private?'
+        required: true
+        type: boolean
+        default: true
+      
+      github_token:
+        description: 'GitHub token (only for private repos)'
+        required: false
+        type: string
+
+      version:
+        description: 'Version (e.g., 1.0.0)'
+        required: false
+        type: string
+        default: '1.0.0'
+      
+      build_number:
+        description: 'Build number (Required)'
+        required: false
+        type: string
+      
+      # Target Platform
+      target_platform:
+        description: 'Target devices'
+        required: true
+        type: choice
+        options:
+          - all_devices
+          - iphone_and_ipad
+          - iphone_only
+          - ipad_only
+          - macos_only
+        default: 'all_devices'
+      
+      # Build Options
+      build_mode:
+        description: 'What to do?'
+        required: true
+        type: choice
+        options:
+          - build_only
+          - publish_to_appstore
+        default: 'build_only'
+      
+      npm_build_command:
+        description: 'Build command'
+        required: false
+        type: string
+        default: 'npm run build'
+      
+      # ========================================
+      # ONE-TIME APPLE CREDENTIALS (JSON format)
+      # ========================================
+      apple_credentials:
+        description: 'Apple credentials JSON (see README for format)'
+        required: true
+        type: string
+      
+      # Per-App: Provisioning Profiles
+      provisioning_profile_base64:
+        description: 'iOS Provisioning profile (.mobileprovision base64)'
+        required: true
+        type: string
+      
+      # Per-App: Mac Catalyst Provisioning Profile (required for macos_only or all_devices)
+      mac_provisioning_profile_base64:
+        description: 'Mac Catalyst Provisioning profile (.provisionprofile base64) - Required for Mac builds'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Parse Apple Credentials
+        id: apple
+        env:
+          APPLE_CREDS: ${{ inputs.apple_credentials }}
+        run: |
+          # Parse the JSON credentials (using env var to avoid shell quoting issues)
+          
+          # Extract values using jq
+          echo "team_id=$(echo "$APPLE_CREDS" | jq -r '.team_id')" >> $GITHUB_OUTPUT
+          echo "certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.certificate_base64')" >> $GITHUB_OUTPUT
+          echo "certificate_password=$(echo "$APPLE_CREDS" | jq -r '.certificate_password')" >> $GITHUB_OUTPUT
+          echo "installer_certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_base64 // empty')" >> $GITHUB_OUTPUT
+          echo "installer_certificate_password=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_password // .certificate_password')" >> $GITHUB_OUTPUT
+          echo "api_key_id=$(echo "$APPLE_CREDS" | jq -r '.api_key_id')" >> $GITHUB_OUTPUT
+          echo "api_issuer_id=$(echo "$APPLE_CREDS" | jq -r '.api_issuer_id')" >> $GITHUB_OUTPUT
+          echo "api_key_base64=$(echo "$APPLE_CREDS" | jq -r '.api_key_base64')" >> $GITHUB_OUTPUT
+          
+          echo "✅ Apple credentials parsed successfully"
+      
+      - name: Configure Git Credentials
+        if: inputs.is_private_repo
+        run: |
+          git config --global url."https://${{ inputs.github_token }}@github.com/".insteadOf "https://github.com/"
+          echo "✅ Git credentials pre-configured for private repo access"
+      
+      - name: Clone App Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository_url }}
+          ref: ${{ inputs.repository_branch }}
+          token: ${{ inputs.is_private_repo && inputs.github_token || github.token }}
+          path: app
+      
+      - name: Read Capacitor Config
+        id: capacitor
+        working-directory: app
+        run: |
+          # 1. Identify Config File
+          if [ -f "capacitor.config.json" ]; then
+            echo "📖 Reading from capacitor.config.json"
+            CONFIG_FILE="capacitor.config.json"
+            IS_JSON=true
+          elif [ -f "capacitor.config.ts" ]; then
+            echo "📖 Reading from capacitor.config.ts"
+            CONFIG_FILE="capacitor.config.ts"
+            IS_JSON=false
+          else
+            echo "❌ Error: No capacitor.config.json or capacitor.config.ts found!"
+            exit 1
+          fi
+
+          # 2. Extract Values
+          if [ "$IS_JSON" = true ]; then
+            CONFIG_CONTENT=$(cat "$CONFIG_FILE")
+            APP_NAME=$(echo "$CONFIG_CONTENT" | jq -r '.appName // empty')
+            APP_ID=$(echo "$CONFIG_CONTENT" | jq -r '.appId // empty')
+            WEB_DIR=$(echo "$CONFIG_CONTENT" | jq -r '.webDir // "www"')
+          else
+            # TypeScript regex extraction (basic)
+            APP_NAME=$(sed -n "s/.*appName:[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p" "$CONFIG_FILE" | head -1)
+            APP_ID=$(sed -n "s/.*appId:[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p" "$CONFIG_FILE" | head -1)
+            WEB_DIR=$(sed -n "s/.*webDir:[[:space:]]*['\"]\\([^'\"]*\\)['\"].*/\\1/p" "$CONFIG_FILE" | head -1)
+            
+            # Default to www if not found
+            if [ -z "$WEB_DIR" ]; then
+              WEB_DIR="www"
+            fi
+          fi
+
+          # 3. Validate
+          if [ -z "$APP_NAME" ] || [ -z "$APP_ID" ]; then
+            echo "❌ Error: 'appName' or 'appId' missing in config!"
+            exit 1
+          fi
+
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "bundle_id=$APP_ID" >> $GITHUB_OUTPUT
+          echo "web_dir=$WEB_DIR" >> $GITHUB_OUTPUT
+          echo "✅ App: $APP_NAME ($APP_ID)"
+          echo "📂 Web Dir: $WEB_DIR"
+      
+      - name: Detect Node Version
+        id: node_version
+        working-directory: app
+        run: |
+          echo "🔍 Detecting required Node.js version..."
+          if [ -f "package.json" ]; then
+            # Extract @capacitor/core version (dependencies or devDependencies)
+            CAP_VER=$(jq -r '.dependencies["@capacitor/core"] // .devDependencies["@capacitor/core"] // empty' package.json)
+            
+            if [ -z "$CAP_VER" ]; then
+              echo "⚠️ Could not find @capacitor/core in package.json. Defaulting to Node 20."
+              NODE_VER="20"
+            else
+              echo "Found @capacitor/core: $CAP_VER"
+              # Extract major version number (remove ^, ~, etc)
+              CAP_MAJOR=$(echo "$CAP_VER" | sed 's/[^0-9.]//g' | cut -d. -f1)
+              
+              if [ "$CAP_MAJOR" -ge 8 ]; then
+                echo "⚡ Capacitor 8+ detected. Using Node 22."
+                NODE_VER="22"
+              elif [ "$CAP_MAJOR" -eq 7 ] || [ "$CAP_MAJOR" -eq 6 ]; then
+                echo "⚡ Capacitor 6/7 detected. Using Node 20."
+                NODE_VER="20"
+              elif [ "$CAP_MAJOR" -le 5 ]; then
+                echo "⚡ Capacitor 5 or older detected. Using Node 18."
+                NODE_VER="18"
+              else
+                echo "⚠️ Unknown Capacitor version. Defaulting to Node 20."
+                NODE_VER="20"
+              fi
+            fi
+          else
+            echo "⚠️ No package.json found. Defaulting to Node 20."
+            NODE_VER="20"
+          fi
+          
+          echo "version=$NODE_VER" >> $GITHUB_OUTPUT
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node_version.outputs.version }}
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+      
+      - name: Install Dependencies
+        working-directory: app
+        run: npm ci
+      
+      - name: Build Web App
+        working-directory: app
+        run: ${{ inputs.npm_build_command }}
+        
+      - name: Sync Capacitor iOS (Link Plugins)
+        working-directory: app
+        run: |
+          WEB_DIR="${{ steps.capacitor.outputs.web_dir }}"
+          
+          # Initialize iOS platform if missing
+          if [ ! -d "ios" ]; then
+            echo "📦 Adding iOS platform..."
+            npx cap add ios --skip-pod-install
+          fi
+
+          # Use 'sync' instead of 'copy' to link the local heic-converter plugin
+          echo "🔗 Syncing plugins and web assets..."
+          npx cap sync ios
+
+          echo "✅ Capacitor iOS files linked and synced"
+          
+      - name: Patch RevenueCat for Mac Catalyst
+        if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
+        working-directory: app
+        run: |
+          echo "🔧 Patching RevenueCat plugin for Mac Catalyst compatibility..."
+          
+          # Find the PurchasesPlugin.swift file
+          PLUGIN_FILE="node_modules/@revenuecat/purchases-capacitor/ios/Sources/RevenuecatPurchasesCapacitor/PurchasesPlugin.swift"
+          
+          if [ ! -f "$PLUGIN_FILE" ]; then
+            echo "⚠️ RevenueCat plugin file not found, skipping patch"
+            exit 0
+          fi
+          
+          # Check if already patched
+          if grep -q "#if !targetEnvironment(macCatalyst)" "$PLUGIN_FILE"; then
+            echo "✅ File already patched"
+            exit 0
+          fi
+          
+          # Patch: Wrap presentCodeRedemptionSheet() call with Mac Catalyst check
+          # The error is at line 566: CommonFunctionality.presentCodeRedemptionSheet()
+          sed -i.bak 's/CommonFunctionality\.presentCodeRedemptionSheet()/#if !targetEnvironment(macCatalyst)\n            CommonFunctionality.presentCodeRedemptionSheet()\n            #else\n            \/\/ presentCodeRedemptionSheet is not available on Mac Catalyst\n            call.reject("Code redemption sheet is not available on Mac Catalyst")\n            return\n            #endif/g' "$PLUGIN_FILE"
+          
+          echo "✅ Patched RevenueCat plugin for Mac Catalyst"
+          echo "📄 Showing patched section:"
+          grep -A5 -B2 "targetEnvironment" "$PLUGIN_FILE" || true
+      
+      - name: Setup Ruby & Fastlane
+        run: |
+          gem install fastlane
+          gem install cocoapods
+      
+      - name: Setup xcodeproj gem
+        run: gem install xcodeproj
+      
+      - name: Sync Xcode Project Deployment Target
+        working-directory: app/ios/App
+        run: |
+          # Read iOS deployment target from the project's Podfile (source of truth)
+          # This avoids overriding what the developer has configured locally
+          if [ -f "Podfile" ]; then
+            IOS_TARGET=$(grep "platform :ios" Podfile | sed "s/.*platform :ios, '\([0-9.]*\)'.*/\1/")
+          fi
+          
+          # Fallback if Podfile doesn't exist or parsing failed
+          if [ -z "$IOS_TARGET" ]; then
+            IOS_TARGET="16.0"
+            echo "⚠️ Could not read target from Podfile, using fallback: $IOS_TARGET"
+          else
+            echo "📖 Read iOS deployment target from Podfile: $IOS_TARGET"
+          fi
+          
+          # Update App.xcodeproj IPHONEOS_DEPLOYMENT_TARGET to match Podfile
+          # (Capacitor sync does not update this automatically)
+          echo "📝 Syncing Xcode project deployment target to $IOS_TARGET..."
+          ruby -e "
+          require 'xcodeproj'
+          
+          ios_target = '$IOS_TARGET'
+          project_path = 'App.xcodeproj'
+          project = Xcodeproj::Project.open(project_path)
+          
+          # Update project-level build settings
+          project.build_configurations.each do |config|
+            config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = ios_target
+            puts \"  ✅ Updated project config: #{config.name}\"
+          end
+          
+          # Update all targets
+          project.targets.each do |target|
+            target.build_configurations.each do |config|
+              config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = ios_target
+            end
+            puts \"  ✅ Updated target: #{target.name}\"
+          end
+          
+          project.save
+          puts \"✅ Xcode project synced to iOS #{ios_target} deployment target\"
+          "
+          
+          # 3. Run pod install to update Pods deployment targets
+          echo "  🔄 Running pod install to update Pods..."
+          pod install
+          
+          echo "✅ iOS deployment target updated to $IOS_TARGET"
+      
+      - name: Enable Mac Catalyst Support
+        if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
+        working-directory: app/ios/App
+        run: |
+          echo "🔧 Enabling Mac Catalyst in App.xcodeproj..."
+          
+          # Create ruby script to modify project
+          cat <<EOF > enable_catalyst.rb
+          require 'xcodeproj'
+          project_path = 'App.xcodeproj'
+          project = Xcodeproj::Project.open(project_path)
+          
+          targets = project.targets.select { |t| t.name == 'App' }
+          if targets.empty?
+            puts "❌ Error: Target 'App' not found!"
+            exit(1)
+          end
+          
+          targets.each do |target|
+            puts "Found target: #{target.name}"
+            target.build_configurations.each do |config|
+              puts "  - Enabling Catalyst for config: #{config.name}"
+              config.build_settings['SUPPORTS_MACCATALYST'] = 'YES'
+              config.build_settings['SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD'] = 'NO'
+            end
+          end
+          
+          project.save
+          puts "✅ Saved changes to App.xcodeproj"
+          EOF
+          
+          ruby enable_catalyst.rb
+      
+      - name: Configure Podfile for Mac Catalyst
+        if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
+        working-directory: app/ios/App
+        run: |
+          echo "🔧 Configuring Podfile for Mac Catalyst support..."
+          
+          if [ ! -f "Podfile" ]; then
+            echo "⚠️ No Podfile found, skipping Catalyst configuration"
+            exit 0
+          fi
+          
+          # Create a comprehensive post_install hook for Mac Catalyst
+          # Key: Disable code signing for Pods (they get embedded into the app which handles signing)
+          echo '# Mac Catalyst Support and Code Signing Fix for CI/CD' > catalyst_post_install.rb
+          echo 'post_install do |installer|' >> catalyst_post_install.rb
+          echo '  installer.pods_project.targets.each do |target|' >> catalyst_post_install.rb
+          echo '    target.build_configurations.each do |config|' >> catalyst_post_install.rb
+          echo '      config.build_settings["SUPPORTS_MACCATALYST"] = "YES"' >> catalyst_post_install.rb
+          echo '      config.build_settings["CODE_SIGN_IDENTITY"] = ""' >> catalyst_post_install.rb
+          echo '      config.build_settings["CODE_SIGNING_REQUIRED"] = "NO"' >> catalyst_post_install.rb
+          echo '      config.build_settings["CODE_SIGNING_ALLOWED"] = "NO"' >> catalyst_post_install.rb
+          echo '    end' >> catalyst_post_install.rb
+          echo '  end' >> catalyst_post_install.rb
+          echo 'end' >> catalyst_post_install.rb
+          
+          # Check if post_install already exists - if so, remove it
+          if grep -q "post_install" Podfile; then
+            echo "📝 Existing post_install found, removing it..."
+            # Use sed to remove the post_install block (from 'post_install' to matching 'end')
+            sed -i.bak '/^post_install/,/^end$/d' Podfile
+            rm -f Podfile.bak
+          fi
+          
+          # Append our post_install hook
+          echo "" >> Podfile
+          cat catalyst_post_install.rb >> Podfile
+          rm catalyst_post_install.rb
+          
+          echo "✅ Added Mac Catalyst configuration with code signing fix to Podfile"
+          echo "📄 Current Podfile post_install:"
+          grep -A 15 "post_install" Podfile || true
+          
+          echo "🔄 Running pod install..."
+          pod install
+          echo "✅ CocoaPods updated with Mac Catalyst support"
+      
+      - name: Disable Code Signing for Pods (App Store)
+        if: inputs.build_mode == 'publish_to_appstore'
+        working-directory: app/ios/App
+        run: |
+          echo "🔧 Disabling code signing for all Pods targets (App Store build)..."
+          
+          # Check if Pods project exists
+          if [ ! -d "Pods/Pods.xcodeproj" ]; then
+            echo "⚠️ Pods.xcodeproj not found, skipping"
+            exit 0
+          fi
+          
+          # Directly modify the Pods.xcodeproj using xcodeproj gem
+          # This is more reliable than modifying Podfile's post_install hook
+          # because Capacitor's Podfile has a simple post_install that doesn't
+          # iterate over targets/configs
+          ruby -e '
+          require "xcodeproj"
+          
+          pods_project_path = "Pods/Pods.xcodeproj"
+          project = Xcodeproj::Project.open(pods_project_path)
+          
+          puts "� Found #{project.targets.count} Pod targets"
+          
+          project.targets.each do |target|
+            target.build_configurations.each do |config|
+              config.build_settings["CODE_SIGN_IDENTITY"] = ""
+              config.build_settings["CODE_SIGNING_REQUIRED"] = "NO"
+              config.build_settings["CODE_SIGNING_ALLOWED"] = "NO"
+              config.build_settings["CODE_SIGN_STYLE"] = "Manual"
+            end
+            puts "  ✅ Disabled signing for: #{target.name}"
+          end
+          
+          project.save
+          puts "✅ Saved changes to Pods.xcodeproj"
+          '
+          
+          echo "✅ Code signing disabled for all Pods targets"
+      
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      
+      - name: Import Certificate
+        id: cert
+        env:
+          CERTIFICATE_BASE64: ${{ steps.apple.outputs.certificate_base64 }}
+          CERTIFICATE_PASSWORD: ${{ steps.apple.outputs.certificate_password }}
+          INSTALLER_CERT_BASE64: ${{ steps.apple.outputs.installer_certificate_base64 }}
+          INSTALLER_CERT_PASSWORD: ${{ steps.apple.outputs.installer_certificate_password }}
+        run: |
+          CERT_PATH=$RUNNER_TEMP/cert.p12
+          INSTALLER_CERT_PATH=$RUNNER_TEMP/installer_cert.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+          
+          echo "$CERTIFICATE_BASE64" | base64 --decode > $CERT_PATH
+          
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security import $CERT_PATH -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          
+          INSTALLER_CERT_NAME=""
+          if [ -n "$INSTALLER_CERT_BASE64" ]; then
+            echo "📥 Importing Mac Installer Certificate..."
+            echo "$INSTALLER_CERT_BASE64" | base64 --decode > $INSTALLER_CERT_PATH
+            security import $INSTALLER_CERT_PATH -P "$INSTALLER_CERT_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+            
+            # Auto-detect the actual installer certificate name from the keychain
+            # The certificate name format is: "3rd Party Mac Developer Installer: Company Name (TEAM_ID)"
+            echo "🔍 Detecting installer certificate name..."
+            INSTALLER_CERT_NAME=$(security find-identity -v -p basic $KEYCHAIN_PATH | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            
+            if [ -n "$INSTALLER_CERT_NAME" ]; then
+              echo "✅ Found installer certificate: $INSTALLER_CERT_NAME"
+            else
+              echo "⚠️ Warning: Could not detect installer certificate name, will use default format"
+              INSTALLER_CERT_NAME="3rd Party Mac Developer Installer: ${{ steps.apple.outputs.team_id }}"
+            fi
+          fi
+          
+          # Output the detected certificate name
+          echo "installer_cert_name=$INSTALLER_CERT_NAME" >> $GITHUB_OUTPUT
+          
+          # Also list all certificates for debugging
+          echo "📋 Certificates in keychain:"
+          security find-identity -v -p basic $KEYCHAIN_PATH
+          
+          security list-keychain -d user -s $KEYCHAIN_PATH
+      
+      - name: Import iOS Provisioning Profile
+        id: provision
+        run: |
+          PP_PATH=$RUNNER_TEMP/profile.mobileprovision
+          echo "${{ inputs.provisioning_profile_base64 }}" | base64 --decode > $PP_PATH
+          
+          # Extract UUID from the profile
+          UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i $PP_PATH))
+          echo "Found iOS Profile UUID: $UUID"
+          
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
+          
+          echo "uuid=$UUID" >> $GITHUB_OUTPUT
+      
+      - name: Import Mac Catalyst Provisioning Profile
+        id: mac_provision
+        if: (inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only') && inputs.mac_provisioning_profile_base64 != ''
+        run: |
+          MAC_PP_PATH=$RUNNER_TEMP/mac_profile.provisionprofile
+          echo "${{ inputs.mac_provisioning_profile_base64 }}" | base64 --decode > $MAC_PP_PATH
+          
+          # Extract UUID from the Mac profile
+          MAC_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i $MAC_PP_PATH))
+          echo "Found Mac Catalyst Profile UUID: $MAC_UUID"
+          
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $MAC_PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/$MAC_UUID.provisionprofile
+          
+          echo "uuid=$MAC_UUID" >> $GITHUB_OUTPUT
+      
+      - name: Update App Info
+        working-directory: app/ios/App
+        run: |
+          if [ -n "${{ inputs.build_number }}" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ inputs.build_number }}" App/Info.plist
+          fi
+          
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ inputs.version }}" App/Info.plist
+      
+      - name: Set App Display Name
+        working-directory: app
+        run: |
+          echo "📛 Setting app display name from Capacitor config..."
+          
+          APP_NAME="${{ steps.capacitor.outputs.app_name }}"
+          echo "  App Name: $APP_NAME"
+          
+          # Set CFBundleDisplayName (shown on Home Screen and Mac Dock)
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" ios/App/App/Info.plist 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $APP_NAME" ios/App/App/Info.plist
+          
+          # Set CFBundleName (shown in Mac menus: About/Hide/Quit)
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" ios/App/App/Info.plist 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" ios/App/App/Info.plist
+          
+          echo "✅ App display name set to: $APP_NAME"
+      
+      - name: Configure Mac Catalyst Entitlements
+        if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
+        working-directory: app/ios/App
+        run: |
+              echo "🔧 Configuring Mac Catalyst App Sandbox..."
+              
+              # 1. Create App.entitlements if it doesn't exist
+              if [ ! -f "App/App.entitlements" ]; then
+                echo "  - Creating App/App.entitlements..."
+                cat <<EOF > App/App.entitlements
+              <?xml version="1.0" encoding="UTF-8"?>
+              <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+              <plist version="1.0">
+              <dict>
+                <key>com.apple.security.app-sandbox</key>
+                <true/>
+                <key>com.apple.security.network.client</key>
+                <true/>
+                <key>com.apple.security.files.user-selected.read-only</key>
+                <true/>
+              </dict>
+              </plist>
+              EOF
+              else
+                echo "  - App.entitlements exists. Ensuring required entitlements..."
+                /usr/libexec/PlistBuddy -c "Add :com.apple.security.app-sandbox bool true" "App/App.entitlements" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :com.apple.security.app-sandbox true" "App/App.entitlements"
+                /usr/libexec/PlistBuddy -c "Add :com.apple.security.network.client bool true" "App/App.entitlements" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :com.apple.security.network.client true" "App/App.entitlements"
+                /usr/libexec/PlistBuddy -c "Add :com.apple.security.files.user-selected.read-only bool true" "App/App.entitlements" 2>/dev/null || true
+              fi
+              
+              # 2. Link Entitlements in Xcode Project using Ruby
+              echo "  - Linking Entitlements in Xcode Project..."
+              cat <<EOF > link_entitlements.rb
+              require 'xcodeproj'
+              project_path = 'App.xcodeproj'
+              project = Xcodeproj::Project.open(project_path)
+              
+              targets = project.targets.select { |t| t.name == 'App' }
+              targets.each do |target|
+                target.build_configurations.each do |config|
+                  # Set CODE_SIGN_ENTITLEMENTS to App/App.entitlements
+                  config.build_settings['CODE_SIGN_ENTITLEMENTS'] = 'App/App.entitlements'
+                  puts "    - Linked entitlements for #{config.name}"
+                end
+              end
+              
+              project.save
+              EOF
+              
+              ruby link_entitlements.rb
+              rm link_entitlements.rb
+              
+              echo "✅ Mac Catalyst entitlements configured with network.client and file access"
+      
+      - name: Configure Target Platform
+        working-directory: app/ios/App
+        run: |
+          # Set target devices based on selection
+          # build_only = simulator (no code signing)
+          # publish_to_appstore = production signing (handled by Fastlane)
+          IS_CATALYST="false"
+          
+          # Determine destination based on target_platform
+          # For build_only, always use simulator destinations
+          # For publish_to_appstore, Fastlane handles the destination
+          case "${{ inputs.target_platform }}" in
+            "iphone_only")
+              DESTINATION="generic/platform=iOS Simulator"
+              DEVICES="1"  # iPhone only
+              ;;
+            "ipad_only")
+              DESTINATION="generic/platform=iOS Simulator"
+              DEVICES="2"  # iPad only
+              ;;
+            "iphone_and_ipad")
+              DESTINATION="generic/platform=iOS Simulator"
+              DEVICES="1,2"  # iPhone + iPad
+              ;;
+            "macos_only")
+              DESTINATION="generic/platform=macOS,variant=Mac Catalyst"
+              DEVICES="1,2"
+              IS_CATALYST="true"
+              ;;
+            *)  # all_devices (default) - iPhone + iPad + Mac Catalyst
+              DESTINATION="generic/platform=macOS,variant=Mac Catalyst"
+              DEVICES="1,2"  # Universal + Mac
+              IS_CATALYST="true"
+              ;;
+          esac
+          
+          # Determine export format and code signing based on build mode
+          if [ "${{ inputs.build_mode }}" == "build_only" ]; then
+            EXPORT_FORMAT="app"
+            CODE_SIGN_IDENTITY="-"
+            CODE_SIGNING_REQUIRED="NO"
+            CODE_SIGNING_ALLOWED="NO"
+            echo "📱 Building for SIMULATOR (no code signing)"
+          else
+            EXPORT_FORMAT="ipa"
+            CODE_SIGN_IDENTITY="Apple Distribution"
+            CODE_SIGNING_REQUIRED="YES"
+            CODE_SIGNING_ALLOWED="YES"
+            echo "📱 Building for APP STORE (production signing)"
+          fi
+          
+          # Store Team ID for code signing
+          TEAM_ID="${{ steps.apple.outputs.team_id }}"
+          
+          echo "DESTINATION=$DESTINATION" >> $GITHUB_ENV
+          echo "TARGET_DEVICES=$DEVICES" >> $GITHUB_ENV
+          echo "IS_CATALYST=$IS_CATALYST" >> $GITHUB_ENV
+          echo "EXPORT_FORMAT=$EXPORT_FORMAT" >> $GITHUB_ENV
+          echo "CODE_SIGN_IDENTITY=$CODE_SIGN_IDENTITY" >> $GITHUB_ENV
+          echo "CODE_SIGNING_REQUIRED=$CODE_SIGNING_REQUIRED" >> $GITHUB_ENV
+          echo "CODE_SIGNING_ALLOWED=$CODE_SIGNING_ALLOWED" >> $GITHUB_ENV
+          echo "TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
+          echo "Building for: ${{ inputs.target_platform }} - format: $EXPORT_FORMAT"
+          
+          # Store app name for file naming (no spaces for filenames)
+          APP_NAME_SAFE=$(echo "${{ steps.capacitor.outputs.app_name }}" | tr ' ' '-')
+          echo "APP_NAME_SAFE=$APP_NAME_SAFE" >> $GITHUB_ENV
+      
+      - name: Disable Automatic Signing for App Store
+        if: inputs.build_mode == 'publish_to_appstore'
+        working-directory: app/ios/App
+        env:
+          PROFILE_UUID: ${{ steps.provision.outputs.uuid }}
+        run: |
+          echo "🔧 Disabling Automatic Signing for App Store build..."
+          echo "require 'xcodeproj'" > disable_signing.rb
+          echo "project = Xcodeproj::Project.open('App.xcodeproj')" >> disable_signing.rb
+          echo "target = project.targets.find { |t| t.name == 'App' }" >> disable_signing.rb
+          echo "target.build_configurations.each do |config|" >> disable_signing.rb
+          echo "  config.build_settings['CODE_SIGN_STYLE'] = 'Manual'" >> disable_signing.rb
+          echo "  if ENV['PROFILE_UUID']" >> disable_signing.rb
+          echo "    config.build_settings['PROVISIONING_PROFILE'] = ENV['PROFILE_UUID']" >> disable_signing.rb
+          echo "    config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = ''" >> disable_signing.rb
+          echo "    puts \"  - Set Provisioning Profile: #{ENV['PROFILE_UUID']}\"" >> disable_signing.rb
+          echo "  end" >> disable_signing.rb
+          echo "  puts \"Disabled automatic signing for configuration: #{config.name}\"" >> disable_signing.rb
+          echo "end" >> disable_signing.rb
+          echo "project.save" >> disable_signing.rb
+          
+          ruby disable_signing.rb
+          rm disable_signing.rb
+
+      - name: Build App
+        working-directory: app/ios/App
+        run: |
+          # Determine output format based on build mode
+          
+          # First, detect Workspace vs Project to avoid errors
+          # Some Capacitor setups (no plugins/pods) use xcodeproj directly
+          if [ -d "App.xcworkspace" ]; then
+            echo "✅ Found App.xcworkspace. Using Workspace build."
+            XC_ARG="-workspace App.xcworkspace"
+            FL_ARG="workspace:App.xcworkspace"
+          elif [ -d "App.xcodeproj" ]; then
+            echo "ℹ️ App.xcworkspace not found. Using App.xcodeproj build."
+            XC_ARG="-project App.xcodeproj"
+            FL_ARG="project:App.xcodeproj"
+          else
+            echo "❌ Error: Neither App.xcworkspace nor App.xcodeproj found in $(pwd)"
+            ls -la
+            exit 1
+          fi
+
+          if [ "${{ inputs.build_mode }}" == "build_only" ]; then
+            # Build .app for testing
+            
+          if [ "${{ inputs.target_platform }}" == "all_devices" ]; then
+              # ALL DEVICES: Build BOTH iOS Simulator and macOS apps (no code signing)
+              echo "🔨 Building iOS Simulator app..."
+              xcodebuild $XC_ARG \
+                -scheme App \
+                -configuration Release \
+                -destination "generic/platform=iOS Simulator" \
+                -derivedDataPath build-simulator \
+                CODE_SIGN_IDENTITY="-" \
+                CODE_SIGNING_REQUIRED=NO \
+                CODE_SIGNING_ALLOWED=NO
+              
+              APP_PATH=$(find build-simulator -name "*.app" -type d | head -1)
+              cp -R "$APP_PATH" "./${APP_NAME_SAFE}-iOS-Simulator.app"
+              zip -r "${APP_NAME_SAFE}-iOS-Simulator.app.zip" "${APP_NAME_SAFE}-iOS-Simulator.app"
+              
+              echo "🔨 Building macOS (Mac Catalyst) app..."
+              xcodebuild $XC_ARG \
+                -scheme App \
+                -configuration Release \
+                -destination "generic/platform=macOS,variant=Mac Catalyst" \
+                -derivedDataPath build-macos \
+                SUPPORTS_MACCATALYST=YES \
+                CODE_SIGN_IDENTITY="-" \
+                CODE_SIGNING_REQUIRED=NO \
+                CODE_SIGNING_ALLOWED=NO
+              
+              APP_PATH=$(find build-macos -name "*.app" -type d | head -1)
+              cp -R "$APP_PATH" "./${APP_NAME_SAFE}-macOS.app"
+              zip -r "${APP_NAME_SAFE}-macOS.app.zip" "${APP_NAME_SAFE}-macOS.app"
+              
+              echo "✅ Built both iOS Simulator and macOS apps"
+              
+            elif [ "$IS_CATALYST" == "true" ]; then
+              # macos_only: Mac Catalyst build only
+              xcodebuild $XC_ARG \
+                -scheme App \
+                -configuration Release \
+                -destination "$DESTINATION" \
+                -derivedDataPath build \
+                SUPPORTS_MACCATALYST=YES \
+                DEVELOPMENT_TEAM="$TEAM_ID" \
+                CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
+                CODE_SIGNING_REQUIRED="$CODE_SIGNING_REQUIRED" \
+                CODE_SIGNING_ALLOWED="$CODE_SIGNING_ALLOWED"
+              
+              APP_PATH=$(find build -name "*.app" -type d | head -1)
+              cp -R "$APP_PATH" "./${APP_NAME_SAFE}.app"
+              zip -r "${APP_NAME_SAFE}.app.zip" "${APP_NAME_SAFE}.app"
+              
+            else
+              # iPhone/iPad only
+              xcodebuild $XC_ARG \
+                -scheme App \
+                -configuration Release \
+                -destination "$DESTINATION" \
+                -derivedDataPath build \
+                DEVELOPMENT_TEAM="$TEAM_ID" \
+                CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
+                CODE_SIGNING_REQUIRED="$CODE_SIGNING_REQUIRED" \
+                CODE_SIGNING_ALLOWED="$CODE_SIGNING_ALLOWED"
+              
+              APP_PATH=$(find build -name "*.app" -type d | head -1)
+              cp -R "$APP_PATH" "./${APP_NAME_SAFE}.app"
+              zip -r "${APP_NAME_SAFE}.app.zip" "${APP_NAME_SAFE}.app"
+            fi
+            
+          else
+            # Build .ipa for App Store submission
+            TEAM_ID="${{ steps.apple.outputs.team_id }}"
+            
+            # Code signing settings for App Store (applies to ALL targets including Pods)
+            XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGN_IDENTITY='Apple Distribution' CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES"
+            
+            # 1. BUILD IOS (If target is NOT macos_only)
+            if [ "${{ inputs.target_platform }}" != "macos_only" ]; then
+              echo "📱 Building iOS App for App Store..."
+              fastlane run build_app \
+                $FL_ARG \
+                scheme:"App" \
+                export_method:"app-store" \
+                output_directory:"." \
+                output_name:"${APP_NAME_SAFE}-iOS.ipa" \
+                export_team_id:"$TEAM_ID" \
+                xcargs:"$XCARGS" \
+                clean:true
+            fi
+
+            # 2. BUILD MAC CATALYST (If target is macos_only OR all_devices)
+            if [ "${{ inputs.target_platform }}" == "macos_only" ] || [ "${{ inputs.target_platform }}" == "all_devices" ]; then
+              echo "💻 Building Mac Catalyst App for App Store..."
+              
+              # Check if Mac provisioning profile was provided
+              MAC_PROFILE_UUID="${{ steps.mac_provision.outputs.uuid }}"
+              if [ -z "$MAC_PROFILE_UUID" ]; then
+                echo "❌ Error: Mac Catalyst builds require mac_provisioning_profile_base64 input!"
+                echo "Please create a 'Mac Catalyst App Store' provisioning profile in Apple Developer Portal."
+                exit 1
+              fi
+              
+              # Get the bundle ID
+              BUNDLE_ID="${{ steps.capacitor.outputs.bundle_id }}"
+              
+              # Get installer cert name for pkg signing (auto-detected during certificate import)
+              INSTALLER_CERT_NAME="${{ steps.cert.outputs.installer_cert_name }}"
+              
+              # Create ExportOptions.plist with EXPLICIT Mac provisioning profile
+              # This prevents Fastlane from auto-detecting the iOS profile
+              echo '<?xml version="1.0" encoding="UTF-8"?>' > MacExportOptions.plist
+              echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' >> MacExportOptions.plist
+              echo '<plist version="1.0">' >> MacExportOptions.plist
+              echo '<dict>' >> MacExportOptions.plist
+              echo '    <key>method</key>' >> MacExportOptions.plist
+              echo '    <string>app-store</string>' >> MacExportOptions.plist
+              echo '    <key>teamID</key>' >> MacExportOptions.plist
+              echo "    <string>$TEAM_ID</string>" >> MacExportOptions.plist
+              echo '    <key>destination</key>' >> MacExportOptions.plist
+              echo '    <string>export</string>' >> MacExportOptions.plist
+              echo '    <key>signingStyle</key>' >> MacExportOptions.plist
+              echo '    <string>manual</string>' >> MacExportOptions.plist
+              echo '    <key>provisioningProfiles</key>' >> MacExportOptions.plist
+              echo '    <dict>' >> MacExportOptions.plist
+              echo "        <key>$BUNDLE_ID</key>" >> MacExportOptions.plist
+              echo "        <string>$MAC_PROFILE_UUID</string>" >> MacExportOptions.plist
+              echo '    </dict>' >> MacExportOptions.plist
+              echo '</dict>' >> MacExportOptions.plist
+              echo '</plist>' >> MacExportOptions.plist
+              
+              echo "📄 Created MacExportOptions.plist with profile UUID: $MAC_PROFILE_UUID"
+              cat MacExportOptions.plist
+              
+              # IMPORTANT: Clear BOTH PROVISIONING_PROFILE (UUID) and PROVISIONING_PROFILE_SPECIFIER to prevent
+              # iOS profile validation error. The "Disable Automatic Signing" step sets PROVISIONING_PROFILE
+              # to the iOS profile UUID, which is invalid for macOS platform.
+              # The correct Mac profile is specified in MacExportOptions.plist for the export phase.
+              MAC_XCARGS="DEVELOPMENT_TEAM=$TEAM_ID CODE_SIGN_IDENTITY='Apple Distribution' CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES PROVISIONING_PROFILE='' PROVISIONING_PROFILE_SPECIFIER=''"
+              
+              fastlane run build_app \
+                $FL_ARG \
+                scheme:"App" \
+                catalyst_platform:"macos" \
+                output_directory:"." \
+                output_name:"${APP_NAME_SAFE}-Mac" \
+                xcargs:"$MAC_XCARGS" \
+                installer_cert_name:"$INSTALLER_CERT_NAME" \
+                skip_profile_detection:true \
+                export_options:"MacExportOptions.plist" \
+                clean:true
+            fi
+          fi
+      
+      - name: Upload to App Store
+        if: inputs.build_mode == 'publish_to_appstore'
+        working-directory: app/ios/App
+        run: |
+          # Get API key content
+          API_KEY_CONTENT=$(echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode)
+          
+          # Required for upload_to_app_store
+          BUNDLE_ID="${{ steps.capacitor.outputs.bundle_id }}"
+          TEAM_ID="${{ steps.apple.outputs.team_id }}"
+          
+          echo "📦 Setting up App Store Connect API key..."
+          
+          # Create api_key.json file for upload_to_app_store
+          # The upload_to_app_store action requires either api_key_path or username
+          # API key JSON format is the standard way to authenticate with App Store Connect API
+          API_KEY_PATH="$RUNNER_TEMP/api_key.json"
+          
+          # Generate JSON using jq to safely handle newlines in the key
+          jq -n \
+            --arg key_id "${{ steps.apple.outputs.api_key_id }}" \
+            --arg issuer_id "${{ steps.apple.outputs.api_issuer_id }}" \
+            --arg key "$API_KEY_CONTENT" \
+            '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' > "$API_KEY_PATH"
+          
+          echo "✅ API key JSON created at: $API_KEY_PATH"
+          
+          # 1. Upload iOS (if exists)
+          if [ -f "${APP_NAME_SAFE}-iOS.ipa" ]; then
+            echo "📱 Uploading iOS IPA: ${APP_NAME_SAFE}-iOS.ipa"
+            fastlane run upload_to_app_store \
+              api_key_path:"$API_KEY_PATH" \
+              app_identifier:"$BUNDLE_ID" \
+              team_id:"$TEAM_ID" \
+              ipa:"${APP_NAME_SAFE}-iOS.ipa" \
+              platform:"ios" \
+              skip_metadata:true \
+              skip_screenshots:true \
+              run_precheck_before_submit:false \
+              submit_for_review:false
+          fi
+
+          # 2. Upload Mac (if exists - checking ipa and pkg)
+          MAC_FILE=""
+          if [ -f "${APP_NAME_SAFE}-Mac.ipa" ]; then
+             MAC_FILE="${APP_NAME_SAFE}-Mac.ipa"
+             MAC_TYPE="ipa"
+          elif [ -f "${APP_NAME_SAFE}-Mac.pkg" ]; then
+             MAC_FILE="${APP_NAME_SAFE}-Mac.pkg"
+             MAC_TYPE="pkg"
+          fi
+
+          if [ -n "$MAC_FILE" ]; then
+            echo "💻 Uploading Mac File: $MAC_FILE"
+            
+            if [ "$MAC_TYPE" == "ipa" ]; then
+               fastlane run upload_to_app_store \
+                api_key_path:"$API_KEY_PATH" \
+                app_identifier:"$BUNDLE_ID" \
+                team_id:"$TEAM_ID" \
+                ipa:"$MAC_FILE" \
+                platform:"osx" \
+                skip_metadata:true \
+                skip_screenshots:true \
+                run_precheck_before_submit:false \
+                submit_for_review:false
+            else
+               fastlane run upload_to_app_store \
+                api_key_path:"$API_KEY_PATH" \
+                app_identifier:"$BUNDLE_ID" \
+                team_id:"$TEAM_ID" \
+                pkg:"$MAC_FILE" \
+                platform:"osx" \
+                skip_metadata:true \
+                skip_screenshots:true \
+                run_precheck_before_submit:false \
+                submit_for_review:false
+            fi
+          fi
+      
+      # Upload artifacts for all_devices builds
+      - name: Upload iOS Simulator Artifact
+        if: inputs.build_mode == 'build_only' && inputs.target_platform == 'all_devices'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.capacitor.outputs.app_name }}-iOS-Simulator-${{ inputs.version }}
+          path: app/ios/App/${{ env.APP_NAME_SAFE }}-iOS-Simulator.app.zip
+          retention-days: 30
+      
+      - name: Upload macOS Artifact
+        if: inputs.build_mode == 'build_only' && inputs.target_platform == 'all_devices'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.capacitor.outputs.app_name }}-macOS-${{ inputs.version }}
+          path: app/ios/App/${{ env.APP_NAME_SAFE }}-macOS.app.zip
+          retention-days: 30
+      
+      # Upload single artifact for other targets
+      - name: Upload App Artifact
+        if: inputs.build_mode == 'build_only' && inputs.target_platform != 'all_devices'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.capacitor.outputs.app_name }}-${{ inputs.target_platform }}-Simulator-${{ inputs.version }}
+          path: app/ios/App/${{ env.APP_NAME_SAFE }}.app.zip
+          retention-days: 30
+      
+      - name: Build Summary
+        run: |
+          echo "## ✅ Build Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "**App:** ${{ steps.capacitor.outputs.app_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Bundle ID:** ${{ steps.capacitor.outputs.bundle_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Platform:** ${{ inputs.target_platform }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.build_mode }}" == "build_only" ]; then
+            if [ "${{ inputs.target_platform }}" == "all_devices" ]; then
+              echo "📦 **Two artifacts available:**" >> $GITHUB_STEP_SUMMARY
+              echo "- 📱 iOS Simulator .app (drag into iOS Simulator)" >> $GITHUB_STEP_SUMMARY
+              echo "- 🖥️ macOS .app (double-click to run)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "📦 Download .app from Artifacts (for Simulator)" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "� Uploaded to App Store Connect" >> $GITHUB_STEP_SUMMARY
+            echo "� Test via **TestFlight** on your real device" >> $GITHUB_STEP_SUMMARY
+          fi
