@@ -365,6 +365,19 @@ jobs:
             fi
 
             if [ -n "$APP" ]; then
+              # Diagnose: check what's in gen/apple/assets
+              echo "📋 gen/apple/assets contents:"
+              ls -la src-tauri/gen/apple/assets/ 2>/dev/null || echo "  (directory missing)"
+              echo "📋 src/ contents:"
+              ls -la src/
+
+              # WORKAROUND: Tauri CLI is not copying frontend files to gen/apple/assets/
+              # Manually inject frontend files into the built .app bundle
+              echo "🔧 Injecting frontend assets into .app bundle..."
+              cp -R src/* "$APP/assets/" 2>/dev/null || true
+              echo "📋 .app/assets/ after injection:"
+              ls -la "$APP/assets/"
+
               cp -R "$APP" "${APP_NAME_SAFE}-iOS.app"
               zip -r "${APP_NAME_SAFE}-iOS.app.zip" "${APP_NAME_SAFE}-iOS.app"
               echo "✅ iOS simulator app: ${APP_NAME_SAFE}-iOS.app.zip"
