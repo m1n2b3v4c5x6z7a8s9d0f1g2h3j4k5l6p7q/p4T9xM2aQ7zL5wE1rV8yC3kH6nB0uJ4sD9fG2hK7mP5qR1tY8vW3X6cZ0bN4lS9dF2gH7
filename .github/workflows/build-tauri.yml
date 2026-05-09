@@ -1,0 +1,500 @@
+name: iOS/macOS Build — Tauri
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: 'Tauri app repository URL'
+        required: true
+        type: string
+      repository_branch:
+        description: 'Branch to build'
+        required: false
+        type: string
+        default: 'main'
+      is_private_repo:
+        description: 'Is repository private?'
+        required: true
+        type: boolean
+        default: true
+      github_token:
+        description: 'GitHub token (only for private repos)'
+        required: false
+        type: string
+      version:
+        description: 'Version (e.g., 1.0.0)'
+        required: false
+        type: string
+        default: '1.0.0'
+      build_number:
+        description: 'Build number'
+        required: false
+        type: string
+      target_platform:
+        description: 'Target devices'
+        required: true
+        type: choice
+        options:
+          - all_devices
+          - iphone_and_ipad
+          - iphone_only
+          - ipad_only
+          - macos_only
+        default: 'all_devices'
+      build_mode:
+        description: 'What to do?'
+        required: true
+        type: choice
+        options:
+          - build_only
+          - publish_to_appstore
+        default: 'build_only'
+      npm_build_command:
+        description: 'Frontend build command'
+        required: false
+        type: string
+        default: 'npm run build'
+      apple_credentials:
+        description: 'Apple credentials JSON (see README)'
+        required: true
+        type: string
+      provisioning_profile_base64:
+        description: 'iOS Provisioning profile (.mobileprovision base64)'
+        required: true
+        type: string
+      mac_provisioning_profile_base64:
+        description: 'macOS Provisioning profile (.provisionprofile base64) — Required for Mac builds'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      # ────────────────────────────────────────
+      #  1. Parse Credentials
+      # ────────────────────────────────────────
+      - name: Parse Apple Credentials
+        id: apple
+        env:
+          APPLE_CREDS: ${{ inputs.apple_credentials }}
+        run: |
+          echo "team_id=$(echo "$APPLE_CREDS" | jq -r '.team_id')" >> $GITHUB_OUTPUT
+          echo "certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.certificate_base64')" >> $GITHUB_OUTPUT
+          echo "certificate_password=$(echo "$APPLE_CREDS" | jq -r '.certificate_password')" >> $GITHUB_OUTPUT
+          echo "installer_certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_base64 // empty')" >> $GITHUB_OUTPUT
+          echo "installer_certificate_password=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_password // .certificate_password')" >> $GITHUB_OUTPUT
+          echo "api_key_id=$(echo "$APPLE_CREDS" | jq -r '.api_key_id')" >> $GITHUB_OUTPUT
+          echo "api_issuer_id=$(echo "$APPLE_CREDS" | jq -r '.api_issuer_id')" >> $GITHUB_OUTPUT
+          echo "api_key_base64=$(echo "$APPLE_CREDS" | jq -r '.api_key_base64')" >> $GITHUB_OUTPUT
+          echo "✅ Apple credentials parsed"
+
+      # ────────────────────────────────────────
+      #  2. Clone Repository
+      # ────────────────────────────────────────
+      - name: Configure Git Credentials
+        if: inputs.is_private_repo
+        run: |
+          git config --global url."https://${{ inputs.github_token }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Clone App Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository_url }}
+          ref: ${{ inputs.repository_branch }}
+          token: ${{ inputs.is_private_repo && inputs.github_token || github.token }}
+          path: app
+
+      # ────────────────────────────────────────
+      #  3. Read Tauri Config
+      # ────────────────────────────────────────
+      - name: Read Tauri Config
+        id: tauri
+        working-directory: app
+        run: |
+          CONF="src-tauri/tauri.conf.json"
+          if [ ! -f "$CONF" ]; then
+            echo "❌ No src-tauri/tauri.conf.json found!"
+            exit 1
+          fi
+
+          APP_NAME=$(jq -r '.productName // "TauriApp"' "$CONF")
+          BUNDLE_ID=$(jq -r '.identifier // empty' "$CONF")
+          IOS_MIN=$(jq -r '.bundle.iOS.minimumSystemVersion // "16.0"' "$CONF")
+
+          if [ -z "$BUNDLE_ID" ]; then
+            echo "❌ 'identifier' missing in tauri.conf.json!"
+            exit 1
+          fi
+
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
+          echo "ios_min=$IOS_MIN" >> $GITHUB_OUTPUT
+
+          APP_NAME_SAFE=$(echo "$APP_NAME" | tr ' ' '-')
+          echo "app_name_safe=$APP_NAME_SAFE" >> $GITHUB_OUTPUT
+
+          echo "✅ App: $APP_NAME ($BUNDLE_ID) — iOS $IOS_MIN+"
+
+      # ────────────────────────────────────────
+      #  4. Setup Toolchains
+      # ────────────────────────────────────────
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('app/src-tauri/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Setup Ruby & Fastlane
+        if: inputs.build_mode == 'publish_to_appstore'
+        run: gem install fastlane
+
+      # ────────────────────────────────────────
+      #  5. Install Frontend Dependencies
+      # ────────────────────────────────────────
+      - name: Install npm Dependencies
+        working-directory: app
+        run: npm ci
+
+      # ────────────────────────────────────────
+      #  6. Code Signing Setup
+      # ────────────────────────────────────────
+      - name: Import Certificate
+        id: cert
+        env:
+          CERTIFICATE_BASE64: ${{ steps.apple.outputs.certificate_base64 }}
+          CERTIFICATE_PASSWORD: ${{ steps.apple.outputs.certificate_password }}
+          INSTALLER_CERT_BASE64: ${{ steps.apple.outputs.installer_certificate_base64 }}
+          INSTALLER_CERT_PASSWORD: ${{ steps.apple.outputs.installer_certificate_password }}
+        run: |
+          CERT_PATH=$RUNNER_TEMP/cert.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          echo "$CERTIFICATE_BASE64" | base64 --decode > $CERT_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security import $CERT_PATH -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+
+          INSTALLER_CERT_NAME=""
+          if [ -n "$INSTALLER_CERT_BASE64" ]; then
+            echo "$INSTALLER_CERT_BASE64" | base64 --decode > $RUNNER_TEMP/installer_cert.p12
+            security import $RUNNER_TEMP/installer_cert.p12 -P "$INSTALLER_CERT_PASSWORD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+            INSTALLER_CERT_NAME=$(security find-identity -v -p basic $KEYCHAIN_PATH | grep "3rd Party Mac Developer Installer" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            echo "✅ Installer cert: $INSTALLER_CERT_NAME"
+          fi
+
+          echo "installer_cert_name=$INSTALLER_CERT_NAME" >> $GITHUB_OUTPUT
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+      - name: Import iOS Provisioning Profile
+        id: provision
+        if: inputs.target_platform != 'macos_only'
+        run: |
+          PP_PATH=$RUNNER_TEMP/profile.mobileprovision
+          echo "${{ inputs.provisioning_profile_base64 }}" | base64 --decode > $PP_PATH
+          UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i $PP_PATH))
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
+          echo "uuid=$UUID" >> $GITHUB_OUTPUT
+          echo "✅ iOS profile: $UUID"
+
+      - name: Import macOS Provisioning Profile
+        id: mac_provision
+        if: (inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only') && inputs.mac_provisioning_profile_base64 != ''
+        run: |
+          MAC_PP_PATH=$RUNNER_TEMP/mac_profile.provisionprofile
+          echo "${{ inputs.mac_provisioning_profile_base64 }}" | base64 --decode > $MAC_PP_PATH
+          MAC_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(security cms -D -i $MAC_PP_PATH))
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp $MAC_PP_PATH ~/Library/MobileDevice/Provisioning\ Profiles/$MAC_UUID.provisionprofile
+          echo "uuid=$MAC_UUID" >> $GITHUB_OUTPUT
+          echo "✅ macOS profile: $MAC_UUID"
+
+      # ────────────────────────────────────────
+      #  7. Initialize Tauri iOS Platform
+      # ────────────────────────────────────────
+      - name: Initialize Tauri iOS
+        if: inputs.target_platform != 'macos_only'
+        working-directory: app
+        run: |
+          if [ ! -d "src-tauri/gen/apple" ]; then
+            cargo tauri ios init
+            echo "✅ iOS platform initialized"
+          else
+            echo "✅ iOS platform already exists"
+          fi
+
+      - name: Configure iOS Signing
+        if: inputs.target_platform != 'macos_only' && inputs.build_mode == 'publish_to_appstore'
+        working-directory: app/src-tauri/gen/apple
+        run: |
+          gem install xcodeproj
+
+          TEAM_ID="${{ steps.apple.outputs.team_id }}"
+          PROFILE_UUID="${{ steps.provision.outputs.uuid }}"
+          BUNDLE_ID="${{ steps.tauri.outputs.bundle_id }}"
+
+          ruby <<'RUBY'
+          require 'xcodeproj'
+
+          # Find the .xcodeproj
+          proj_path = Dir.glob("*.xcodeproj").first
+          unless proj_path
+            puts "❌ No .xcodeproj found in gen/apple/"
+            exit 1
+          end
+
+          project = Xcodeproj::Project.open(proj_path)
+          team_id = ENV.fetch("TEAM_ID", "")
+          profile_uuid = ENV.fetch("PROFILE_UUID", "")
+
+          app_target = project.targets.find { |t| t.product_type&.include?("application") }
+          unless app_target
+            puts "❌ No application target found"
+            exit 1
+          end
+
+          app_target.build_configurations.each do |config|
+            config.build_settings['CODE_SIGN_STYLE'] = 'Manual'
+            config.build_settings['DEVELOPMENT_TEAM'] = team_id
+            config.build_settings['CODE_SIGN_IDENTITY'] = 'Apple Distribution'
+            config.build_settings['PROVISIONING_PROFILE'] = profile_uuid
+            config.build_settings['PROVISIONING_PROFILE_SPECIFIER'] = ''
+            puts "  ✅ Configured signing for: #{config.name}"
+          end
+
+          project.save
+          puts "✅ Xcode project signing configured"
+          RUBY
+
+          echo "✅ iOS signing configured for App Store"
+
+      - name: Update iOS Version Info
+        if: inputs.target_platform != 'macos_only'
+        working-directory: app/src-tauri/gen/apple
+        run: |
+          # Find Info.plist in the generated project
+          PLIST=$(find . -name "Info.plist" -not -path "*/build/*" | head -1)
+          if [ -n "$PLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ inputs.version }}" "$PLIST" 2>/dev/null || true
+            if [ -n "${{ inputs.build_number }}" ]; then
+              /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ inputs.build_number }}" "$PLIST" 2>/dev/null || true
+            fi
+            echo "✅ Version: ${{ inputs.version }} (${{ inputs.build_number }})"
+          fi
+
+      # ────────────────────────────────────────
+      #  8. Build iOS
+      # ────────────────────────────────────────
+      - name: Build iOS
+        if: inputs.target_platform != 'macos_only'
+        working-directory: app
+        env:
+          APPLE_DEVELOPMENT_TEAM: ${{ steps.apple.outputs.team_id }}
+        run: |
+          APP_NAME_SAFE="${{ steps.tauri.outputs.app_name_safe }}"
+
+          if [ "${{ inputs.build_mode }}" == "publish_to_appstore" ]; then
+            echo "📱 Building iOS for App Store..."
+            cargo tauri ios build --export-method app-store-connect
+
+            # Find the generated .ipa
+            IPA=$(find src-tauri/gen/apple -name "*.ipa" -type f | head -1)
+            if [ -n "$IPA" ]; then
+              cp "$IPA" "${APP_NAME_SAFE}-iOS.ipa"
+              echo "✅ iOS IPA: ${APP_NAME_SAFE}-iOS.ipa"
+            else
+              echo "❌ No .ipa found after build"
+              find src-tauri/gen/apple -name "*.ipa" -o -name "*.app" | head -20
+              exit 1
+            fi
+          else
+            echo "📱 Building iOS (debug/simulator)..."
+            cargo tauri ios build --debug 2>&1 || true
+
+            # Find .app for simulator
+            APP=$(find src-tauri/gen/apple -name "*.app" -type d | head -1)
+            if [ -n "$APP" ]; then
+              cp -R "$APP" "${APP_NAME_SAFE}-iOS.app"
+              zip -r "${APP_NAME_SAFE}-iOS.app.zip" "${APP_NAME_SAFE}-iOS.app"
+              echo "✅ iOS app: ${APP_NAME_SAFE}-iOS.app.zip"
+            fi
+          fi
+
+      # ────────────────────────────────────────
+      #  9. Build macOS (Native, not Catalyst)
+      # ────────────────────────────────────────
+      - name: Build macOS
+        if: inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only'
+        working-directory: app
+        env:
+          APPLE_DEVELOPMENT_TEAM: ${{ steps.apple.outputs.team_id }}
+          APPLE_SIGNING_IDENTITY: "Apple Distribution"
+        run: |
+          APP_NAME_SAFE="${{ steps.tauri.outputs.app_name_safe }}"
+
+          echo "🖥️ Building native macOS app..."
+
+          if [ "${{ inputs.build_mode }}" == "publish_to_appstore" ]; then
+            # Update tauri.conf.json for macOS signing
+            TEAM_ID="${{ steps.apple.outputs.team_id }}"
+
+            cargo tauri build --ci
+
+            # Find the built .app
+            APP=$(find src-tauri/target/release/bundle -name "*.app" -type d | head -1)
+            DMG=$(find src-tauri/target/release/bundle -name "*.dmg" -type f | head -1)
+
+            if [ -n "$APP" ]; then
+              # Create a signed .pkg for App Store upload
+              MAC_PROFILE_UUID="${{ steps.mac_provision.outputs.uuid }}"
+              INSTALLER_CERT="${{ steps.cert.outputs.installer_cert_name }}"
+
+              if [ -n "$INSTALLER_CERT" ]; then
+                echo "📦 Creating signed .pkg for App Store..."
+                productbuild \
+                  --component "$APP" /Applications \
+                  --sign "$INSTALLER_CERT" \
+                  "${APP_NAME_SAFE}-macOS.pkg"
+                echo "✅ macOS pkg: ${APP_NAME_SAFE}-macOS.pkg"
+              else
+                echo "⚠️ No installer certificate — copying .app instead"
+                cp -R "$APP" "${APP_NAME_SAFE}-macOS.app"
+                zip -r "${APP_NAME_SAFE}-macOS.app.zip" "${APP_NAME_SAFE}-macOS.app"
+              fi
+            fi
+          else
+            cargo tauri build --debug 2>&1 || true
+
+            APP=$(find src-tauri/target/debug/bundle -name "*.app" -type d | head -1)
+            if [ -n "$APP" ]; then
+              cp -R "$APP" "${APP_NAME_SAFE}-macOS.app"
+              zip -r "${APP_NAME_SAFE}-macOS.app.zip" "${APP_NAME_SAFE}-macOS.app"
+              echo "✅ macOS app: ${APP_NAME_SAFE}-macOS.app.zip"
+            fi
+          fi
+
+      # ────────────────────────────────────────
+      #  10. Upload to App Store
+      # ────────────────────────────────────────
+      - name: Upload to App Store
+        if: inputs.build_mode == 'publish_to_appstore'
+        working-directory: app
+        run: |
+          API_KEY_CONTENT=$(echo "${{ steps.apple.outputs.api_key_base64 }}" | base64 --decode)
+          BUNDLE_ID="${{ steps.tauri.outputs.bundle_id }}"
+          TEAM_ID="${{ steps.apple.outputs.team_id }}"
+          APP_NAME_SAFE="${{ steps.tauri.outputs.app_name_safe }}"
+
+          API_KEY_PATH="$RUNNER_TEMP/api_key.json"
+          jq -n \
+            --arg key_id "${{ steps.apple.outputs.api_key_id }}" \
+            --arg issuer_id "${{ steps.apple.outputs.api_issuer_id }}" \
+            --arg key "$API_KEY_CONTENT" \
+            '{key_id: $key_id, issuer_id: $issuer_id, key: $key, in_house: false}' > "$API_KEY_PATH"
+
+          # Upload iOS
+          if [ -f "${APP_NAME_SAFE}-iOS.ipa" ]; then
+            echo "📱 Uploading iOS IPA..."
+            fastlane run upload_to_app_store \
+              api_key_path:"$API_KEY_PATH" \
+              app_identifier:"$BUNDLE_ID" \
+              team_id:"$TEAM_ID" \
+              ipa:"${APP_NAME_SAFE}-iOS.ipa" \
+              platform:"ios" \
+              skip_metadata:true \
+              skip_screenshots:true \
+              run_precheck_before_submit:false \
+              submit_for_review:false
+          fi
+
+          # Upload macOS
+          if [ -f "${APP_NAME_SAFE}-macOS.pkg" ]; then
+            echo "🖥️ Uploading macOS pkg..."
+            fastlane run upload_to_app_store \
+              api_key_path:"$API_KEY_PATH" \
+              app_identifier:"$BUNDLE_ID" \
+              team_id:"$TEAM_ID" \
+              pkg:"${APP_NAME_SAFE}-macOS.pkg" \
+              platform:"osx" \
+              skip_metadata:true \
+              skip_screenshots:true \
+              run_precheck_before_submit:false \
+              submit_for_review:false
+          fi
+
+      # ────────────────────────────────────────
+      #  11. Upload Artifacts
+      # ────────────────────────────────────────
+      - name: Upload iOS Artifact
+        if: inputs.build_mode == 'build_only' && inputs.target_platform != 'macos_only'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tauri.outputs.app_name }}-iOS-${{ inputs.version }}
+          path: app/${{ steps.tauri.outputs.app_name_safe }}-iOS.app.zip
+          retention-days: 30
+
+      - name: Upload macOS Artifact
+        if: inputs.build_mode == 'build_only' && (inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tauri.outputs.app_name }}-macOS-${{ inputs.version }}
+          path: app/${{ steps.tauri.outputs.app_name_safe }}-macOS.app.zip
+          retention-days: 30
+
+      - name: Upload iOS IPA
+        if: inputs.build_mode == 'publish_to_appstore' && inputs.target_platform != 'macos_only'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.tauri.outputs.app_name }}-iOS-IPA-${{ inputs.version }}
+          path: app/${{ steps.tauri.outputs.app_name_safe }}-iOS.ipa
+          retention-days: 30
+
+      # ────────────────────────────────────────
+      #  12. Summary
+      # ────────────────────────────────────────
+      - name: Build Summary
+        run: |
+          echo "## ✅ Tauri Build Complete!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **App** | ${{ steps.tauri.outputs.app_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Bundle ID** | ${{ steps.tauri.outputs.bundle_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Version** | ${{ inputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Platform** | ${{ inputs.target_platform }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Mode** | ${{ inputs.build_mode }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.build_mode }}" == "publish_to_appstore" ]; then
+            echo "🚀 Uploaded to App Store Connect — test via **TestFlight**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "📦 Download artifacts from the Actions tab" >> $GITHUB_STEP_SUMMARY
+          fi
