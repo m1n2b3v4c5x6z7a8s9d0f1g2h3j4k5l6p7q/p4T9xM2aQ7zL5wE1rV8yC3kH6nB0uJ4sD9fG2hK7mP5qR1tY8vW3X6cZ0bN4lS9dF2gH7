@@ -249,12 +249,10 @@ jobs:
         env:
           APPLE_DEVELOPMENT_TEAM: ${{ steps.apple.outputs.team_id }}
         run: |
-          if [ ! -d "src-tauri/gen/apple" ]; then
-            cargo tauri ios init
-            echo "✅ iOS platform initialized"
-          else
-            echo "✅ iOS platform already exists"
-          fi
+          # Always regenerate to pick up Swift plugin changes
+          rm -rf src-tauri/gen/apple
+          cargo tauri ios init
+          echo "✅ iOS platform initialized"
 
       - name: Disable Code Signing (build_only)
         if: inputs.target_platform != 'macos_only' && inputs.build_mode == 'build_only'
