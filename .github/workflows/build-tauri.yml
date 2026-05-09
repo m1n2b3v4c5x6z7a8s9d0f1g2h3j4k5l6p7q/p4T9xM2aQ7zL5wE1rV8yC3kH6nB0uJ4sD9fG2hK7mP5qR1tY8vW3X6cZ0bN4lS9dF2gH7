@@ -21,10 +21,6 @@ on:
         description: 'GitHub token (only for private repos)'
         required: false
         type: string
-      build_number:
-        description: 'Build number'
-        required: false
-        type: string
       target_platform:
         description: 'Target devices'
         required: true
@@ -304,16 +300,6 @@ jobs:
           RUBY
 
           echo "✅ iOS signing configured for App Store"
-
-      - name: Set iOS Build Number
-        if: inputs.target_platform != 'macos_only' && inputs.build_number != ''
-        working-directory: app/src-tauri/gen/apple
-        run: |
-          PLIST=$(find . -name "Info.plist" -not -path "*/build/*" | head -1)
-          if [ -n "$PLIST" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ inputs.build_number }}" "$PLIST" 2>/dev/null || true
-            echo "✅ Build number set to: ${{ inputs.build_number }}"
-          fi
 
       # ────────────────────────────────────────
       #  8. Build iOS
