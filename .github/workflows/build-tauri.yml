@@ -355,15 +355,22 @@ jobs:
               exit 1
             fi
           else
-            echo "📱 Building iOS (build_only, debug)..."
-            cargo tauri ios build --debug 2>&1 || true
+            echo "📱 Building iOS Simulator (build_only, debug)..."
+            cargo tauri ios build --debug --target aarch64-apple-ios-sim 2>&1 || true
 
-            # Find .app
-            APP=$(find src-tauri/gen/apple -name "*.app" -type d | head -1)
+            # Find simulator .app from DerivedData or gen/apple build products
+            APP=$(find ~/Library/Developer/Xcode/DerivedData -path "*/debug-iphonesimulator/*.app" -type d 2>/dev/null | head -1)
+            if [ -z "$APP" ]; then
+              APP=$(find src-tauri/gen/apple -name "*.app" -type d | head -1)
+            fi
+
             if [ -n "$APP" ]; then
               cp -R "$APP" "${APP_NAME_SAFE}-iOS.app"
               zip -r "${APP_NAME_SAFE}-iOS.app.zip" "${APP_NAME_SAFE}-iOS.app"
-              echo "✅ iOS app: ${APP_NAME_SAFE}-iOS.app.zip"
+              echo "✅ iOS simulator app: ${APP_NAME_SAFE}-iOS.app.zip"
+            else
+              echo "❌ No .app found after simulator build"
+              exit 1
             fi
           fi
 
@@ -488,31 +495,3 @@ jobs:
           path: app/${{ steps.tauri.outputs.app_name_safe }}-macOS.app.zip
           retention-days: 30
 
-      - name: Upload iOS IPA
-        if: inputs.build_mode == 'publish_to_appstore' && inputs.target_platform != 'macos_only'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.tauri.outputs.app_name }}-iOS-IPA-${{ steps.tauri.outputs.version }}
-          path: app/${{ steps.tauri.outputs.app_name_safe }}-iOS.ipa
-          retention-days: 30
-
-      # ────────────────────────────────────────
-      #  12. Summary
-      # ────────────────────────────────────────
-      - name: Build Summary
-        run: |
-          echo "## ✅ Tauri Build Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **App** | ${{ steps.tauri.outputs.app_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Bundle ID** | ${{ steps.tauri.outputs.bundle_id }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Version** | ${{ steps.tauri.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Platform** | ${{ inputs.target_platform }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Mode** | ${{ inputs.build_mode }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ inputs.build_mode }}" == "publish_to_appstore" ]; then
-            echo "🚀 Uploaded to App Store Connect — test via **TestFlight**" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "📦 Download artifacts from the Actions tab" >> $GITHUB_STEP_SUMMARY
-          fi
