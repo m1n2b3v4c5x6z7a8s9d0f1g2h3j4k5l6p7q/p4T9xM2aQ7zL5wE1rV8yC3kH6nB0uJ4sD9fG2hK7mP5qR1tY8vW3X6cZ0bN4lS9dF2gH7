@@ -55,15 +55,15 @@ on:
         type: string
         default: 'npm run build'
       apple_credentials:
-        description: 'Apple credentials JSON (see README)'
-        required: true
+        description: 'Apple credentials JSON — only required for publish_to_appstore'
+        required: false
         type: string
       provisioning_profile_base64:
-        description: 'iOS Provisioning profile (.mobileprovision base64)'
-        required: true
+        description: 'iOS Provisioning profile (.mobileprovision base64) — only for publish_to_appstore'
+        required: false
         type: string
       mac_provisioning_profile_base64:
-        description: 'macOS Provisioning profile (.provisionprofile base64) — Required for Mac builds'
+        description: 'macOS Provisioning profile (.provisionprofile base64) — only for publish_to_appstore'
         required: false
         type: string
 
@@ -77,9 +77,14 @@ jobs:
       # ────────────────────────────────────────
       - name: Parse Apple Credentials
         id: apple
+        if: inputs.build_mode == 'publish_to_appstore'
         env:
           APPLE_CREDS: ${{ inputs.apple_credentials }}
         run: |
+          if [ -z "$APPLE_CREDS" ]; then
+            echo "❌ apple_credentials is required for publish_to_appstore!"
+            exit 1
+          fi
           echo "team_id=$(echo "$APPLE_CREDS" | jq -r '.team_id')" >> $GITHUB_OUTPUT
           echo "certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.certificate_base64')" >> $GITHUB_OUTPUT
           echo "certificate_password=$(echo "$APPLE_CREDS" | jq -r '.certificate_password')" >> $GITHUB_OUTPUT
@@ -186,6 +191,7 @@ jobs:
       # ────────────────────────────────────────
       - name: Import Certificate
         id: cert
+        if: inputs.build_mode == 'publish_to_appstore'
         env:
           CERTIFICATE_BASE64: ${{ steps.apple.outputs.certificate_base64 }}
           CERTIFICATE_PASSWORD: ${{ steps.apple.outputs.certificate_password }}
@@ -216,7 +222,7 @@ jobs:
 
       - name: Import iOS Provisioning Profile
         id: provision
-        if: inputs.target_platform != 'macos_only'
+        if: inputs.build_mode == 'publish_to_appstore' && inputs.target_platform != 'macos_only'
         run: |
           PP_PATH=$RUNNER_TEMP/profile.mobileprovision
           echo "${{ inputs.provisioning_profile_base64 }}" | base64 --decode > $PP_PATH
@@ -228,7 +234,7 @@ jobs:
 
       - name: Import macOS Provisioning Profile
         id: mac_provision
-        if: (inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only') && inputs.mac_provisioning_profile_base64 != ''
+        if: inputs.build_mode == 'publish_to_appstore' && (inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only') && inputs.mac_provisioning_profile_base64 != ''
         run: |
           MAC_PP_PATH=$RUNNER_TEMP/mac_profile.provisionprofile
           echo "${{ inputs.mac_provisioning_profile_base64 }}" | base64 --decode > $MAC_PP_PATH
