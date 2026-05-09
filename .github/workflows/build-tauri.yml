@@ -21,11 +21,6 @@ on:
         description: 'GitHub token (only for private repos)'
         required: false
         type: string
-      version:
-        description: 'Version (e.g., 1.0.0)'
-        required: false
-        type: string
-        default: '1.0.0'
       build_number:
         description: 'Build number'
         required: false
@@ -55,8 +50,8 @@ on:
         type: string
         default: 'npm run build'
       apple_credentials:
-        description: 'Apple credentials JSON — only required for publish_to_appstore'
-        required: false
+        description: 'Apple credentials JSON'
+        required: true
         type: string
       provisioning_profile_base64:
         description: 'iOS Provisioning profile (.mobileprovision base64) — only for publish_to_appstore'
@@ -73,27 +68,22 @@ jobs:
 
     steps:
       # ────────────────────────────────────────
-      #  1. Parse Credentials
+      #  1. Parse Credentials (always — team_id needed for all builds)
       # ────────────────────────────────────────
       - name: Parse Apple Credentials
         id: apple
-        if: inputs.build_mode == 'publish_to_appstore'
         env:
           APPLE_CREDS: ${{ inputs.apple_credentials }}
         run: |
-          if [ -z "$APPLE_CREDS" ]; then
-            echo "❌ apple_credentials is required for publish_to_appstore!"
-            exit 1
-          fi
           echo "team_id=$(echo "$APPLE_CREDS" | jq -r '.team_id')" >> $GITHUB_OUTPUT
-          echo "certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.certificate_base64')" >> $GITHUB_OUTPUT
-          echo "certificate_password=$(echo "$APPLE_CREDS" | jq -r '.certificate_password')" >> $GITHUB_OUTPUT
+          echo "certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.certificate_base64 // empty')" >> $GITHUB_OUTPUT
+          echo "certificate_password=$(echo "$APPLE_CREDS" | jq -r '.certificate_password // empty')" >> $GITHUB_OUTPUT
           echo "installer_certificate_base64=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_base64 // empty')" >> $GITHUB_OUTPUT
-          echo "installer_certificate_password=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_password // .certificate_password')" >> $GITHUB_OUTPUT
-          echo "api_key_id=$(echo "$APPLE_CREDS" | jq -r '.api_key_id')" >> $GITHUB_OUTPUT
-          echo "api_issuer_id=$(echo "$APPLE_CREDS" | jq -r '.api_issuer_id')" >> $GITHUB_OUTPUT
-          echo "api_key_base64=$(echo "$APPLE_CREDS" | jq -r '.api_key_base64')" >> $GITHUB_OUTPUT
-          echo "✅ Apple credentials parsed"
+          echo "installer_certificate_password=$(echo "$APPLE_CREDS" | jq -r '.installer_certificate_password // .certificate_password // empty')" >> $GITHUB_OUTPUT
+          echo "api_key_id=$(echo "$APPLE_CREDS" | jq -r '.api_key_id // empty')" >> $GITHUB_OUTPUT
+          echo "api_issuer_id=$(echo "$APPLE_CREDS" | jq -r '.api_issuer_id // empty')" >> $GITHUB_OUTPUT
+          echo "api_key_base64=$(echo "$APPLE_CREDS" | jq -r '.api_key_base64 // empty')" >> $GITHUB_OUTPUT
+          echo "✅ Apple credentials parsed (team: $(echo "$APPLE_CREDS" | jq -r '.team_id'))"
 
       # ────────────────────────────────────────
       #  2. Clone Repository
@@ -126,6 +116,7 @@ jobs:
 
           APP_NAME=$(jq -r '.productName // "TauriApp"' "$CONF")
           BUNDLE_ID=$(jq -r '.identifier // empty' "$CONF")
+          VERSION=$(jq -r '.version // "0.1.0"' "$CONF")
           IOS_MIN=$(jq -r '.bundle.iOS.minimumSystemVersion // "16.0"' "$CONF")
 
           if [ -z "$BUNDLE_ID" ]; then
@@ -135,12 +126,13 @@ jobs:
 
           echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
           echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "ios_min=$IOS_MIN" >> $GITHUB_OUTPUT
 
           APP_NAME_SAFE=$(echo "$APP_NAME" | tr ' ' '-')
           echo "app_name_safe=$APP_NAME_SAFE" >> $GITHUB_OUTPUT
 
-          echo "✅ App: $APP_NAME ($BUNDLE_ID) — iOS $IOS_MIN+"
+          echo "✅ App: $APP_NAME ($BUNDLE_ID) v$VERSION — iOS $IOS_MIN+"
 
       # ────────────────────────────────────────
       #  4. Setup Toolchains
@@ -195,7 +187,7 @@ jobs:
           fi
 
       # ────────────────────────────────────────
-      #  6. Code Signing Setup
+      #  6. Code Signing Setup (publish_to_appstore only)
       # ────────────────────────────────────────
       - name: Import Certificate
         id: cert
@@ -258,6 +250,8 @@ jobs:
       - name: Initialize Tauri iOS
         if: inputs.target_platform != 'macos_only'
         working-directory: app
+        env:
+          APPLE_DEVELOPMENT_TEAM: ${{ steps.apple.outputs.team_id }}
         run: |
           if [ ! -d "src-tauri/gen/apple" ]; then
             cargo tauri ios init
@@ -311,18 +305,14 @@ jobs:
 
           echo "✅ iOS signing configured for App Store"
 
-      - name: Update iOS Version Info
-        if: inputs.target_platform != 'macos_only'
+      - name: Set iOS Build Number
+        if: inputs.target_platform != 'macos_only' && inputs.build_number != ''
         working-directory: app/src-tauri/gen/apple
         run: |
-          # Find Info.plist in the generated project
           PLIST=$(find . -name "Info.plist" -not -path "*/build/*" | head -1)
           if [ -n "$PLIST" ]; then
-            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ inputs.version }}" "$PLIST" 2>/dev/null || true
-            if [ -n "${{ inputs.build_number }}" ]; then
-              /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ inputs.build_number }}" "$PLIST" 2>/dev/null || true
-            fi
-            echo "✅ Version: ${{ inputs.version }} (${{ inputs.build_number }})"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ inputs.build_number }}" "$PLIST" 2>/dev/null || true
+            echo "✅ Build number set to: ${{ inputs.build_number }}"
           fi
 
       # ────────────────────────────────────────
@@ -351,10 +341,10 @@ jobs:
               exit 1
             fi
           else
-            echo "📱 Building iOS (debug/simulator)..."
+            echo "📱 Building iOS (build_only, debug)..."
             cargo tauri ios build --debug 2>&1 || true
 
-            # Find .app for simulator
+            # Find .app
             APP=$(find src-tauri/gen/apple -name "*.app" -type d | head -1)
             if [ -n "$APP" ]; then
               cp -R "$APP" "${APP_NAME_SAFE}-iOS.app"
@@ -472,7 +462,7 @@ jobs:
         if: inputs.build_mode == 'build_only' && inputs.target_platform != 'macos_only'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.tauri.outputs.app_name }}-iOS-${{ inputs.version }}
+          name: ${{ steps.tauri.outputs.app_name }}-iOS-${{ steps.tauri.outputs.version }}
           path: app/${{ steps.tauri.outputs.app_name_safe }}-iOS.app.zip
           retention-days: 30
 
@@ -480,7 +470,7 @@ jobs:
         if: inputs.build_mode == 'build_only' && (inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only')
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.tauri.outputs.app_name }}-macOS-${{ inputs.version }}
+          name: ${{ steps.tauri.outputs.app_name }}-macOS-${{ steps.tauri.outputs.version }}
           path: app/${{ steps.tauri.outputs.app_name_safe }}-macOS.app.zip
           retention-days: 30
 
@@ -488,7 +478,7 @@ jobs:
         if: inputs.build_mode == 'publish_to_appstore' && inputs.target_platform != 'macos_only'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.tauri.outputs.app_name }}-iOS-IPA-${{ inputs.version }}
+          name: ${{ steps.tauri.outputs.app_name }}-iOS-IPA-${{ steps.tauri.outputs.version }}
           path: app/${{ steps.tauri.outputs.app_name_safe }}-iOS.ipa
           retention-days: 30
 
@@ -503,7 +493,7 @@ jobs:
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| **App** | ${{ steps.tauri.outputs.app_name }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Bundle ID** | ${{ steps.tauri.outputs.bundle_id }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Version** | ${{ inputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Version** | ${{ steps.tauri.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Platform** | ${{ inputs.target_platform }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Mode** | ${{ inputs.build_mode }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
