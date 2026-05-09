@@ -146,7 +146,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-ios
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
 
       - name: Cache Rust
         uses: actions/cache@v4
@@ -356,7 +356,7 @@ jobs:
             fi
           else
             echo "📱 Building iOS Simulator (build_only, debug)..."
-            cargo tauri ios build --debug --target aarch64-sim 2>&1 || true
+            cargo tauri ios build --debug --target aarch64-sim 2>&1
 
             # Find simulator .app from DerivedData or gen/apple build products
             APP=$(find ~/Library/Developer/Xcode/DerivedData -path "*/debug-iphonesimulator/*.app" -type d 2>/dev/null | head -1)
