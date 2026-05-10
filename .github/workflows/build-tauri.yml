@@ -356,6 +356,37 @@ jobs:
             fi
           else
             echo "📱 Building iOS Simulator (build_only, debug)..."
+
+            # Step 1: Generate the iOS project first
+            cargo tauri ios init 2>&1 || true
+
+            # Step 2: Disable ENABLE_DEBUG_DYLIB in project.yml (XcodeGen source)
+            # Xcode 16+ creates a stub executable + .debug.dylib by default for debug builds.
+            # This mechanism ONLY works when launched from Xcode with debugger attached.
+            # When installed standalone (xcrun simctl install), the stub can't load the dylib,
+            # resulting in a white/blank screen. Setting ENABLE_DEBUG_DYLIB=NO produces a
+            # standard single executable that works everywhere.
+            echo "🔧 Patching project.yml to disable debug dylib..."
+            PROJYML=$(find src-tauri/gen/apple -name "project.yml" -type f | head -1)
+            if [ -n "$PROJYML" ]; then
+              echo "  Found: $PROJYML"
+              # Check if already patched
+              if grep -q "ENABLE_DEBUG_DYLIB" "$PROJYML"; then
+                echo "  ℹ️ Already contains ENABLE_DEBUG_DYLIB setting"
+              else
+                # Insert ENABLE_DEBUG_DYLIB: "NO" after the "base:" line in settings
+                # Uses sed substitution to append on the same match (avoids YAML escaping issues)
+                sed -i '' 's/^  base:/  base:\n    ENABLE_DEBUG_DYLIB: "NO"/' "$PROJYML" 2>/dev/null || \
+                sed -i 's/^  base:/  base:\n    ENABLE_DEBUG_DYLIB: "NO"/' "$PROJYML" 2>/dev/null || true
+                echo "  ✅ Injected ENABLE_DEBUG_DYLIB: NO into project.yml"
+              fi
+              echo "  📋 project.yml settings section:"
+              grep -A 5 "base:" "$PROJYML" | head -10
+            else
+              echo "  ⚠️ No project.yml found — build may use debug dylib"
+            fi
+
+            # Step 3: Build (Tauri CLI uses patched project.yml → XcodeGen → xcodebuild)
             cargo tauri ios build --debug --target aarch64-sim 2>&1
 
             # Find simulator .app from DerivedData or gen/apple build products
@@ -365,18 +396,13 @@ jobs:
             fi
 
             if [ -n "$APP" ]; then
-              # Diagnose: check what's in gen/apple/assets
-              echo "📋 gen/apple/assets contents:"
-              ls -la src-tauri/gen/apple/assets/ 2>/dev/null || echo "  (directory missing)"
-              echo "📋 src/ contents:"
-              ls -la src/
-
-              # WORKAROUND: Tauri CLI is not copying frontend files to gen/apple/assets/
-              # Manually inject frontend files into the built .app bundle
-              echo "🔧 Injecting frontend assets into .app bundle..."
-              cp -R src/* "$APP/assets/" 2>/dev/null || true
-              echo "📋 .app/assets/ after injection:"
-              ls -la "$APP/assets/"
+              # Diagnostic: show full .app bundle structure
+              echo "📋 Full .app bundle contents:"
+              find "$APP" -type f | head -30
+              echo "📋 Executable info:"
+              file "$APP"/* 2>/dev/null | head -10
+              echo "📋 Check for debug dylib (should NOT exist if patch worked):"
+              ls -la "$APP"/*.dylib 2>/dev/null || echo "  ✅ No dylibs — standard executable"
 
               cp -R "$APP" "${APP_NAME_SAFE}-iOS.app"
               zip -r "${APP_NAME_SAFE}-iOS.app.zip" "${APP_NAME_SAFE}-iOS.app"
