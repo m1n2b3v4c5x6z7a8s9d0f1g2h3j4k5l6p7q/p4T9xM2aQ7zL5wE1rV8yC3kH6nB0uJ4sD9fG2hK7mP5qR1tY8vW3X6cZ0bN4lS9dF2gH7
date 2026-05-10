@@ -113,7 +113,6 @@ jobs:
           APP_NAME=$(jq -r '.productName // "TauriApp"' "$CONF")
           BUNDLE_ID=$(jq -r '.identifier // empty' "$CONF")
           VERSION=$(jq -r '.version // "0.1.0"' "$CONF")
-          IOS_MIN=$(jq -r '.bundle.iOS.minimumSystemVersion // "16.0"' "$CONF")
 
           if [ -z "$BUNDLE_ID" ]; then
             echo "❌ 'identifier' missing in tauri.conf.json!"
@@ -123,12 +122,11 @@ jobs:
           echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
           echo "bundle_id=$BUNDLE_ID" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "ios_min=$IOS_MIN" >> $GITHUB_OUTPUT
 
           APP_NAME_SAFE=$(echo "$APP_NAME" | tr ' ' '-')
           echo "app_name_safe=$APP_NAME_SAFE" >> $GITHUB_OUTPUT
 
-          echo "✅ App: $APP_NAME ($BUNDLE_ID) v$VERSION — iOS $IOS_MIN+"
+          echo "✅ App: $APP_NAME ($BUNDLE_ID) v$VERSION"
 
       # ────────────────────────────────────────
       #  4. Setup Toolchains
@@ -149,7 +147,7 @@ jobs:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
 
       - name: Cache Rust
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -371,14 +369,6 @@ jobs:
             fi
 
             if [ -n "$APP" ]; then
-              # Diagnostic: show full .app bundle structure
-              echo "📋 Full .app bundle contents:"
-              find "$APP" -type f | head -30
-              echo "📋 Executable info:"
-              file "$APP"/* 2>/dev/null | head -10
-              echo "📋 Check for debug dylib (should NOT exist if patch worked):"
-              ls -la "$APP"/*.dylib 2>/dev/null || echo "  ✅ No dylibs — standard executable"
-
               cp -R "$APP" "${APP_NAME_SAFE}-iOS.app"
               zip -r "${APP_NAME_SAFE}-iOS.app.zip" "${APP_NAME_SAFE}-iOS.app"
               echo "✅ iOS simulator app: ${APP_NAME_SAFE}-iOS.app.zip"
@@ -431,9 +421,12 @@ jobs:
               fi
             fi
           else
-            cargo tauri build --debug 2>&1 || true
+            # Build WITHOUT --debug to produce a standard executable.
+            # Same rationale as iOS: debug builds may use ENABLE_DEBUG_DYLIB on newer Xcode,
+            # producing stub executables that only work under the Xcode debugger.
+            cargo tauri build 2>&1
 
-            APP=$(find src-tauri/target/debug/bundle -name "*.app" -type d | head -1)
+            APP=$(find src-tauri/target/release/bundle -name "*.app" -type d | head -1)
             if [ -n "$APP" ]; then
               cp -R "$APP" "${APP_NAME_SAFE}-macOS.app"
               zip -r "${APP_NAME_SAFE}-macOS.app.zip" "${APP_NAME_SAFE}-macOS.app"
@@ -495,7 +488,7 @@ jobs:
       # ────────────────────────────────────────
       - name: Upload iOS Artifact
         if: inputs.build_mode == 'build_only' && inputs.target_platform != 'macos_only'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.tauri.outputs.app_name }}-iOS-${{ steps.tauri.outputs.version }}
           path: app/${{ steps.tauri.outputs.app_name_safe }}-iOS.app.zip
@@ -503,7 +496,7 @@ jobs:
 
       - name: Upload macOS Artifact
         if: inputs.build_mode == 'build_only' && (inputs.target_platform == 'all_devices' || inputs.target_platform == 'macos_only')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.tauri.outputs.app_name }}-macOS-${{ steps.tauri.outputs.version }}
           path: app/${{ steps.tauri.outputs.app_name_safe }}-macOS.app.zip
