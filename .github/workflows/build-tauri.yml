@@ -386,7 +386,6 @@ jobs:
         working-directory: app
         env:
           APPLE_DEVELOPMENT_TEAM: ${{ steps.apple.outputs.team_id }}
-          APPLE_SIGNING_IDENTITY: "Apple Distribution"
         run: |
           APP_NAME_SAFE="${{ steps.tauri.outputs.app_name_safe }}"
 
@@ -395,6 +394,7 @@ jobs:
           if [ "${{ inputs.build_mode }}" == "publish_to_appstore" ]; then
             # Update tauri.conf.json for macOS signing
             TEAM_ID="${{ steps.apple.outputs.team_id }}"
+            export APPLE_SIGNING_IDENTITY="Apple Distribution"
 
             cargo tauri build --ci
 
@@ -421,10 +421,9 @@ jobs:
               fi
             fi
           else
-            # Build WITHOUT --debug to produce a standard executable.
-            # Same rationale as iOS: debug builds may use ENABLE_DEBUG_DYLIB on newer Xcode,
-            # producing stub executables that only work under the Xcode debugger.
-            cargo tauri build 2>&1
+            # build_only: skip code signing (no certificate in keychain)
+            export APPLE_SIGNING_IDENTITY="-"
+            cargo tauri build --ci 2>&1
 
             APP=$(find src-tauri/target/release/bundle -name "*.app" -type d | head -1)
             if [ -n "$APP" ]; then
