@@ -355,42 +355,17 @@ jobs:
               exit 1
             fi
           else
-            echo "📱 Building iOS Simulator (build_only, debug)..."
+            echo "📱 Building iOS Simulator (build_only, release)..."
 
-            # Step 1: Generate the iOS project first
-            cargo tauri ios init 2>&1 || true
-
-            # Step 2: Disable ENABLE_DEBUG_DYLIB in project.yml (XcodeGen source)
-            # Xcode 16+ creates a stub executable + .debug.dylib by default for debug builds.
-            # This mechanism ONLY works when launched from Xcode with debugger attached.
-            # When installed standalone (xcrun simctl install), the stub can't load the dylib,
-            # resulting in a white/blank screen. Setting ENABLE_DEBUG_DYLIB=NO produces a
-            # standard single executable that works everywhere.
-            echo "🔧 Patching project.yml to disable debug dylib..."
-            PROJYML=$(find src-tauri/gen/apple -name "project.yml" -type f | head -1)
-            if [ -n "$PROJYML" ]; then
-              echo "  Found: $PROJYML"
-              # Check if already patched
-              if grep -q "ENABLE_DEBUG_DYLIB" "$PROJYML"; then
-                echo "  ℹ️ Already contains ENABLE_DEBUG_DYLIB setting"
-              else
-                # Insert ENABLE_DEBUG_DYLIB: "NO" after the "base:" line in settings
-                # Uses sed substitution to append on the same match (avoids YAML escaping issues)
-                sed -i '' 's/^  base:/  base:\n    ENABLE_DEBUG_DYLIB: "NO"/' "$PROJYML" 2>/dev/null || \
-                sed -i 's/^  base:/  base:\n    ENABLE_DEBUG_DYLIB: "NO"/' "$PROJYML" 2>/dev/null || true
-                echo "  ✅ Injected ENABLE_DEBUG_DYLIB: NO into project.yml"
-              fi
-              echo "  📋 project.yml settings section:"
-              grep -A 5 "base:" "$PROJYML" | head -10
-            else
-              echo "  ⚠️ No project.yml found — build may use debug dylib"
-            fi
-
-            # Step 3: Build (Tauri CLI uses patched project.yml → XcodeGen → xcodebuild)
-            cargo tauri ios build --debug --target aarch64-sim 2>&1
+            # Build WITHOUT --debug to avoid Xcode 16's ENABLE_DEBUG_DYLIB mechanism.
+            # Debug builds create a stub executable + .debug.dylib that ONLY works when
+            # launched from Xcode with debugger attached. When installed standalone
+            # (xcrun simctl install from CI artifacts), the stub fails → white screen.
+            # Release builds produce a standard single executable that works everywhere.
+            cargo tauri ios build --target aarch64-sim 2>&1
 
             # Find simulator .app from DerivedData or gen/apple build products
-            APP=$(find ~/Library/Developer/Xcode/DerivedData -path "*/debug-iphonesimulator/*.app" -type d 2>/dev/null | head -1)
+            APP=$(find ~/Library/Developer/Xcode/DerivedData -path "*-iphonesimulator/*.app" -type d 2>/dev/null | head -1)
             if [ -z "$APP" ]; then
               APP=$(find src-tauri/gen/apple -name "*.app" -type d | head -1)
             fi
