@@ -164,7 +164,7 @@ jobs:
         run: gem install fastlane
 
       # ────────────────────────────────────────
-      #  5. Install Frontend Dependencies (if applicable)
+      #  5. Install & Build Frontend
       # ────────────────────────────────────────
       - name: Install npm Dependencies
         working-directory: app
@@ -179,6 +179,50 @@ jobs:
           else
             echo "⏭️ No package.json — skipping npm install"
           fi
+
+      - name: Build Frontend
+        working-directory: app
+        run: |
+          BUILD_CMD="${{ inputs.npm_build_command }}"
+          if [ -z "$BUILD_CMD" ]; then
+            echo "⏭️ No build command specified — assuming static site"
+          else
+            echo "🔨 Running frontend build: $BUILD_CMD"
+            eval "$BUILD_CMD"
+            echo "✅ Frontend build completed"
+          fi
+
+      - name: Verify Frontend Assets
+        working-directory: app
+        run: |
+          # Read frontendDist from tauri.conf.json (relative to src-tauri/)
+          FRONTEND_DIST=$(jq -r '.build.frontendDist // "../dist"' src-tauri/tauri.conf.json)
+
+          # Resolve path relative to src-tauri/
+          if [[ "$FRONTEND_DIST" == ../* ]]; then
+            DIST_PATH="${FRONTEND_DIST#../}"
+          else
+            DIST_PATH="src-tauri/$FRONTEND_DIST"
+          fi
+
+          echo "📂 Checking frontend assets in: $DIST_PATH"
+
+          if [ ! -d "$DIST_PATH" ]; then
+            echo "❌ Frontend dist directory '$DIST_PATH' does not exist!"
+            echo "   Check your build command and frontendDist path in tauri.conf.json"
+            exit 1
+          fi
+
+          if [ ! -f "$DIST_PATH/index.html" ]; then
+            echo "❌ No index.html found in $DIST_PATH"
+            echo "   Available files:"
+            ls -la "$DIST_PATH" 2>/dev/null || echo "  (empty)"
+            exit 1
+          fi
+
+          FILE_COUNT=$(find "$DIST_PATH" -type f | wc -l)
+          echo "✅ Frontend assets verified: $FILE_COUNT files in $DIST_PATH"
+          ls -la "$DIST_PATH"
 
       # ────────────────────────────────────────
       #  6. Code Signing Setup (publish_to_appstore only)
@@ -500,4 +544,3 @@ jobs:
           name: ${{ steps.tauri.outputs.app_name }}-macOS-${{ steps.tauri.outputs.version }}
           path: app/${{ steps.tauri.outputs.app_name_safe }}-macOS.app.zip
           retention-days: 30
-
