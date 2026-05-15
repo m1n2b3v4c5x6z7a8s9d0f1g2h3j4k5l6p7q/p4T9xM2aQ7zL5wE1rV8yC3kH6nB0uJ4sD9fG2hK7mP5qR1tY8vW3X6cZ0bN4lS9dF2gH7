@@ -296,6 +296,45 @@ jobs:
           cargo tauri ios init
           echo "✅ iOS platform initialized"
 
+      # ── CRITICAL FIX: Tauri CLI does not copy frontendDist to
+      #    gen/apple/assets/ when beforeBuildCommand is empty.
+      #    We must inject them manually before xcodebuild runs.
+      - name: Inject Frontend Assets into iOS Bundle
+        if: inputs.target_platform != 'macos_only'
+        working-directory: app
+        run: |
+          FRONTEND_DIST=$(jq -r '.build.frontendDist // "../dist"' src-tauri/tauri.conf.json)
+
+          # Resolve relative to src-tauri/
+          if [[ "$FRONTEND_DIST" == ../* ]]; then
+            SRC_PATH="${FRONTEND_DIST#../}"
+          else
+            SRC_PATH="src-tauri/$FRONTEND_DIST"
+          fi
+
+          DEST="src-tauri/gen/apple/assets"
+
+          if [ ! -d "$SRC_PATH" ]; then
+            echo "❌ Frontend source '$SRC_PATH' not found!"
+            exit 1
+          fi
+
+          # Clear any stale/empty assets dir and copy fresh
+          rm -rf "$DEST"
+          mkdir -p "$DEST"
+          cp -R "$SRC_PATH"/* "$DEST"/
+
+          # Verify
+          if [ ! -f "$DEST/index.html" ]; then
+            echo "❌ index.html missing after copy to $DEST"
+            ls -laR "$DEST"
+            exit 1
+          fi
+
+          ASSET_COUNT=$(find "$DEST" -type f | wc -l | tr -d ' ')
+          echo "✅ Injected $ASSET_COUNT frontend files into $DEST"
+          ls -la "$DEST"
+
       - name: Disable Code Signing (build_only)
         if: inputs.target_platform != 'macos_only' && inputs.build_mode == 'build_only'
         working-directory: app/src-tauri/gen/apple
@@ -382,6 +421,10 @@ jobs:
         run: |
           APP_NAME_SAFE="${{ steps.tauri.outputs.app_name_safe }}"
 
+          # Pre-build: confirm assets are in place
+          echo "📋 Pre-build asset check:"
+          ls src-tauri/gen/apple/assets/ 2>/dev/null || echo "  ⚠️ assets/ dir missing or empty"
+
           if [ "${{ inputs.build_mode }}" == "publish_to_appstore" ]; then
             echo "📱 Building iOS for App Store..."
             cargo tauri ios build --export-method app-store-connect
@@ -413,6 +456,16 @@ jobs:
             fi
 
             if [ -n "$APP" ]; then
+              # Post-build: verify assets inside the .app bundle
+              echo "📋 Post-build .app asset check:"
+              if [ -f "$APP/assets/index.html" ]; then
+                BUNDLE_ASSETS=$(find "$APP/assets" -type f | wc -l | tr -d ' ')
+                echo "  ✅ assets/index.html found — $BUNDLE_ASSETS files in bundle"
+              else
+                echo "  ⚠️ assets/index.html NOT in .app — checking structure:"
+                find "$APP" -maxdepth 2 -type f | head -20
+              fi
+
               cp -R "$APP" "${APP_NAME_SAFE}-iOS.app"
               zip -r "${APP_NAME_SAFE}-iOS.app.zip" "${APP_NAME_SAFE}-iOS.app"
               echo "✅ iOS simulator app: ${APP_NAME_SAFE}-iOS.app.zip"
